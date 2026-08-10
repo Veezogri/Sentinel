@@ -2,7 +2,7 @@
 
 **Real-Time Industrial Monitoring Platform** — Java 21 · Spring Boot · Kafka · Angular
 
-> **Project status: Milestone 0 — Bootstrap.**
+> **Project status: Milestone 1 — Domain model.**
 > This README documents only what exists in the repository today. Everything else lives in
 > the [Roadmap](#roadmap) until it is actually implemented. No performance figure will appear
 > here unless it comes from a real measured run.
@@ -52,8 +52,9 @@ partial outages — not a CRUD application with a message broker bolted on.
                                         └───────────────────┘
 ```
 
-**Implemented today:** the Spring Boot application shell and its health surface, plus the
-PostgreSQL / Kafka / Redis containers. Nothing in the data path exists yet.
+**Implemented today:** the Spring Boot application shell and its health surface, the
+PostgreSQL / Kafka / Redis containers, and the [domain model](#domain-model) with its rule
+engine. Nothing is wired to the data path yet — no ingestion, no persistence, no transport.
 
 The backend is a **modular monolith**: one deployable, with domains separated by package
 (`machine`, `telemetry`, `alert`, `rule`, `realtime`, `security`, …). This keeps transactional
@@ -163,6 +164,135 @@ decisions, so topics get declared explicitly rather than appearing by accident.
 
 ---
 
+## Domain model
+
+The domain is plain Java with no framework annotations, no persistence types and no Spring
+dependency. It can be exercised entirely with unit tests and no running infrastructure.
+
+```mermaid
+classDiagram
+    class Machine {
+        UUID id
+        String name
+        MachineType type
+        OperationalMode operationalMode
+        Instant registeredAt
+    }
+    class MachineState {
+        UUID machineId
+        TelemetryReadings latestReadings
+        Instant lastTelemetryAt
+        HealthStatus healthStatus
+        Instant lastUpdatedAt
+        connectivityAt(now, offlineAfter) ConnectivityStatus
+    }
+    class TelemetryEvent {
+        UUID eventId
+        UUID machineId
+        Instant occurredAt
+    }
+    class TelemetryReadings {
+        double temperatureCelsius
+        double vibrationMillimetresPerSecond
+        double pressureBar
+        double powerConsumptionKilowatts
+        double rotationSpeedRpm
+    }
+    class Alert {
+        UUID id
+        AlertType type
+        AlertSeverity severity
+        AlertStatus status
+        acknowledge(at) Alert
+        resolve(at) Alert
+    }
+    TelemetryEvent *-- TelemetryReadings
+    MachineState *-- TelemetryReadings
+    Machine "1" -- "0..1" MachineState : current state
+    Machine "1" -- "*" Alert : raised for
+```
+
+**`Machine` and `MachineState` are separate objects**, split along how often they change: the
+registry entry changes when an operator edits the fleet, the state changes on every event.
+Merging them would rewrite a low-volume relational row on every telemetry sample.
+
+**Machine status is three orthogonal enums, not one.** `ConnectivityStatus` (is telemetry
+arriving?), `HealthStatus` (is the equipment behaving?) and `OperationalMode` (is it under
+supervision?) vary independently — a single enum forces a machine that goes quiet while critical
+to forget it was critical. `ConnectivityStatus` is *derived* from `lastTelemetryAt` rather than
+stored, so it can never go stale and needs no periodic sweep to stay accurate; `HealthStatus` is
+stored, because it is the outcome of a rule evaluation rather than a function of the clock.
+Full reasoning in [ADR-001](docs/adr/ADR-001-machine-state-modelling.md).
+
+**Structurally invalid is not the same as abnormal.** `TelemetryReadings` rejects only what
+cannot physically exist — a NaN, a negative rotation speed, a temperature below absolute zero.
+A reading of 140 °C is accepted, because it is a valid measurement describing a machine in
+trouble, and discarding it would throw away exactly what the platform exists to detect.
+
+**`MachineState.apply` ignores events that are not strictly newer** than the current state.
+Kafka preserves order within a partition and telemetry is keyed by machine, but that guarantee
+does not survive a retry or a replay from an earlier offset — and overwriting current readings
+with a stale sample is worse than dropping it.
+
+### Rule engine
+
+`RuleEngine` evaluates every configured `Rule` against an `EvaluationContext` and returns the
+findings. It creates no alerts: deduplication, cooldown and identity are stateful decisions that
+arrive in M6 and will sit on top of this, so naming it `AlertEngine` today would promise
+behaviour it does not have.
+
+A rule returns a `RuleResult`, a sealed type with exactly two cases — `Triggered` and
+`NotTriggered` — so "nothing found" is a value with a name rather than a `null`, and a `switch`
+over the outcome is checked for exhaustiveness by the compiler.
+
+| Rule | Condition | Severity |
+|---|---|---|
+| `HighTemperatureRule` | `temperature >= 80 °C` / `>= 95 °C` | `WARNING` / `CRITICAL` |
+| `ExcessiveVibrationRule` | `vibration >= 8 mm/s` / `>= 14 mm/s` | `WARNING` / `CRITICAL` |
+| `AbnormalPressureRule` | outside `[1, 10] bar` | `WARNING` |
+
+Thresholds are constructor arguments with named defaults, never literals inside the comparison,
+so a rule can be reconfigured per machine type and tested at its boundaries without being edited.
+Comparisons are inclusive: a threshold of 80 means 80 is already a problem, and that convention
+is pinned by tests.
+
+Rules are immutable and stateless, so one `RuleEngine` instance is safe to share across every
+consumer thread without synchronisation.
+
+## Alert lifecycle
+
+An alert is not a mutable status holder. `Alert` is immutable, transitions return a new
+instance, and the status can only move through `acknowledge` and `resolve` — which is what keeps
+it consistent with its three timestamps.
+
+```mermaid
+stateDiagram-v2
+    [*] --> ACTIVE : rule triggered
+    ACTIVE --> ACKNOWLEDGED : acknowledge(at)
+    ACTIVE --> RESOLVED : resolve(at)
+    ACKNOWLEDGED --> RESOLVED : resolve(at)
+    RESOLVED --> [*]
+```
+
+`ACTIVE → RESOLVED` skips acknowledgment on purpose: a condition that clears before anyone
+looked at it is a normal outcome, not something to force through an operator action.
+
+Invalid transitions **throw** rather than being silently ignored:
+
+| Attempt | Behaviour | Why |
+|---|---|---|
+| Acknowledge an `ACKNOWLEDGED` alert | `InvalidAlertTransitionException` | The second operator would be told they took ownership while the recorded timestamp stays the first one's |
+| Acknowledge a `RESOLVED` alert | `InvalidAlertTransitionException` | `RESOLVED` is terminal |
+| Resolve a `RESOLVED` alert | `InvalidAlertTransitionException` | Would move the recorded end of an already closed incident |
+
+These are real concurrency outcomes — two operators acting at once, or an operator acknowledging
+just as the condition clears. Treating the loser as a success would report an action that never
+happened; refusing lets the API answer `409 Conflict`. Callers driving resolution from rule
+evaluation should test `isOpen()` rather than use the exception for flow control.
+
+All lifecycle timestamps are passed in, never read from the system clock, so the whole lifecycle
+is testable without freezing time globally.
+
 ## REST API
 
 Base path `/api/v1`. Only one endpoint exists so far.
@@ -189,19 +319,30 @@ cd backend && ./mvnw test
 |---|---|
 | `SentinelApplicationTests` | full context startup — catches a broken bean graph or an unresolvable placeholder |
 | `SystemHealthControllerTest` | health contract: HTTP status, JSON shape, and that the build version is really substituted at package time |
+| `TelemetryReadingsTest` | the invalid-vs-abnormal boundary: NaN and negatives rejected, 140 °C accepted |
+| `AlertTest` | every lifecycle transition, and every refused one |
+| `MachineStateTest` | connectivity derivation at its threshold, and stale-event rejection |
+| `MachineTest` | registration, maintenance mode, immutability of mutators |
+| `HighTemperatureRuleTest`, `ExcessiveVibrationRuleTest`, `AbnormalPressureRuleTest` | threshold behaviour just below, exactly at, and just above each limit |
+| `RuleEngineTest` | zero, one and several simultaneous findings; worst-severity health |
 
-No test requires a running container at this stage. Testcontainers-based integration tests
-arrive with persistence (M4).
+The domain is tested with plain JUnit — no `@SpringBootTest`, no mocks. The business objects are
+directly instantiable, so there is nothing to stand up and nothing to fake; the only Spring test
+in the suite is the M0 bootstrap check. No test requires a running container at this stage.
+Testcontainers-based integration tests arrive with persistence (M4).
 
 ---
 
 ## Engineering decisions
 
-Recorded as they are made, with the reasoning that justified them. Architecture Decision
-Records land in `docs/adr/` from Milestone 3 onward, once the first non-obvious trade-offs
-(Kafka partitioning, idempotency strategy) are actually taken.
+Recorded as they are made, with the reasoning that justified them. Architecture Decision Records
+live in [`docs/adr/`](docs/adr/):
 
-Decisions taken so far:
+- [**ADR-001 — Machine state modelling**](docs/adr/ADR-001-machine-state-modelling.md): why a
+  single `MachineStatus` enum was replaced by three orthogonal ones, why `Machine` and
+  `MachineState` are separate objects, and why connectivity is derived while health is stored.
+
+Decisions not large enough to warrant their own record:
 
 - **Modular monolith, not microservices.** One deployable with strict package boundaries.
   Splitting a system into services before knowing its real coupling and load profile buys
@@ -213,16 +354,32 @@ Decisions taken so far:
   patched, and it makes the bootstrap test lie about what the application needs to start.
 - **Enforced JDK floor.** `maven-enforcer-plugin` fails the build below JDK 21, which is
   cheaper to diagnose than an unsupported class-file version error deep in the build.
+- **No framework annotations in the domain.** No `@Entity`, no `@RedisHash`, no Spring types on
+  business objects. Mapping to storage will be explicit at the edges (M4/M5) rather than turning
+  the model into a database schema with methods.
 
 ---
 
 ## Known limitations
 
-At Milestone 0, this is a bootstrap and nothing more:
+At Milestone 1, the domain exists but nothing carries data into it:
 
-- No domain model, no telemetry ingestion, no alerting, no persistence, no frontend.
-- The backend does not connect to PostgreSQL, Kafka or Redis yet — the containers are
-  provisioned and healthy, but unused.
+- No ingestion, no persistence, no transport. The rule engine is never invoked at runtime — it
+  is exercised only by tests, and no code path yet turns a `RuleResult` into an `Alert`.
+- No deduplication, cooldown or lifecycle orchestration; only the transitions themselves are
+  enforced (M6).
+- Rules are single-sample. Temporal rules ("above 85 °C for 30 seconds") need previous state and
+  land later; `EvaluationContext` exists so they can be added without changing rule signatures.
+- `MACHINE_OFFLINE` is declared as an alert type but no rule produces it: it is time-driven
+  rather than telemetry-driven, and its detection lands with M5.
+- Thresholds are per-rule constructor arguments with hardcoded defaults; making them
+  configurable per machine type is a later concern.
+- The backend does not connect to PostgreSQL, Kafka or Redis — the containers are defined but
+  unused.
+- **`docker-compose.yml` has never been executed.** It was written and structurally validated,
+  but not run: the current Docker Desktop release requires macOS Sonoma and the development
+  machine is on Ventura. A Ventura-compatible Docker Desktop version must be installed before
+  the milestones that genuinely need Kafka, PostgreSQL, Redis or Testcontainers (M3 onward).
 - `/actuator/health` reports only application liveness, since there is no dependency to probe.
 - No authentication: every endpoint is currently public (security lands in M12).
 - The Docker Compose stack is a single-node development setup — one Kafka broker, no
@@ -234,7 +391,7 @@ At Milestone 0, this is a bootstrap and nothing more:
 ## Roadmap
 
 - [x] **M0** — Bootstrap: backend skeleton, infrastructure, CI, health endpoint
-- [ ] **M1** — Domain model: Machine, TelemetryEvent, MachineState, Alert
+- [x] **M1** — Domain model: Machine, TelemetryEvent, MachineState, Alert, rule engine
 - [ ] **M2** — Telemetry simulator with stateful, realistic value evolution
 - [ ] **M3** — Kafka ingestion: serialization, partitioning by `machineId`, consumer groups
 - [ ] **M4** — PostgreSQL: Flyway, telemetry history, indexes, Testcontainers
@@ -259,13 +416,19 @@ At Milestone 0, this is a bootstrap and nothing more:
 ```text
 sentinel/
 ├── backend/                  Spring Boot application (Java 21, Maven)
-│   ├── src/main/java/com/sentinel/
-│   ├── src/main/resources/
-│   └── src/test/java/com/sentinel/
+│   └── src/main/java/com/sentinel/
+│       ├── machine/domain/   Machine, MachineState, status enums
+│       ├── telemetry/domain/ TelemetryEvent, TelemetryReadings
+│       ├── alert/domain/     Alert and its lifecycle
+│       ├── rule/domain/      Rule, RuleResult, RuleEngine, rules/
+│       └── system/           Health endpoint
+├── docs/adr/                 Architecture Decision Records
 ├── .github/workflows/        CI pipelines
 ├── docker-compose.yml        Local infrastructure
 └── .env.example              Configuration template
 ```
 
-`frontend/`, `simulator/`, `infrastructure/` and `docs/` appear as the milestones that fill
-them land — empty scaffolding directories are not committed ahead of time.
+Each domain module will grow an `infrastructure/` package beside its `domain/` one when it
+acquires persistence or messaging (M3 onward). `frontend/`, `simulator/` and `infrastructure/`
+appear as the milestones that fill them land — empty scaffolding directories are not committed
+ahead of time.
