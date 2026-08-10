@@ -1,0 +1,24 @@
+# Build output
+target/
+build/
+
+# Local environment — never commit real secrets (see .env.example)
+.env
+
+# IDE
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+.settings/
+.classpath
+.project
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+logs/
