@@ -1,0 +1,97 @@
+# Sentinel — local development infrastructure.
+#
+# Milestone 0 provisions only the three backing services the platform will need.
+# The backend, frontend, Prometheus and Grafana are added by the milestones that
+# actually introduce them, so `docker compose up` stays fast during development.
+#
+#   cp .env.example .env
+#   docker compose up -d --wait
+
+services:
+
+  postgres:
+    image: postgres:16-alpine
+    container_name: sentinel-postgres
+    environment:
+      POSTGRES_DB: ${DB_NAME:-sentinel}
+      POSTGRES_USER: ${DB_USER:-sentinel}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:-sentinel}
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-sentinel} -d ${DB_NAME:-sentinel}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+    networks:
+      - sentinel
+
+  redis:
+    image: redis:7-alpine
+    container_name: sentinel-redis
+    # Append-only persistence: machine state held in Redis should survive a
+    # container restart during development rather than silently emptying.
+    command: ["redis-server", "--appendonly", "yes"]
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    volumes:
+      - redis-data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+    networks:
+      - sentinel
+
+  kafka:
+    # KRaft mode: a single node acting as both broker and controller. No ZooKeeper,
+    # which keeps the local stack to one container for the broker.
+    image: apache/kafka:3.9.0
+    container_name: sentinel-kafka
+    environment:
+      KAFKA_NODE_ID: 1
+      KAFKA_PROCESS_ROLES: broker,controller
+      KAFKA_CONTROLLER_QUORUM_VOTERS: 1@kafka:9093
+      KAFKA_CONTROLLER_LISTENER_NAMES: CONTROLLER
+      # Two listeners on purpose:
+      #   INTERNAL (29092) — reachable as kafka:29092 from other containers
+      #   EXTERNAL  (9092) — reachable as localhost:9092 from the host (IDE, tests)
+      # A single listener cannot advertise a hostname valid in both places.
+      KAFKA_LISTENERS: INTERNAL://0.0.0.0:29092,EXTERNAL://0.0.0.0:9092,CONTROLLER://0.0.0.0:9093
+      KAFKA_ADVERTISED_LISTENERS: INTERNAL://kafka:29092,EXTERNAL://localhost:9092
+      KAFKA_LISTENER_SECURITY_PROTOCOL_MAP: INTERNAL:PLAINTEXT,EXTERNAL:PLAINTEXT,CONTROLLER:PLAINTEXT
+      KAFKA_INTER_BROKER_LISTENER_NAME: INTERNAL
+      # Single-broker cluster: replication cannot exceed 1.
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_REPLICATION_FACTOR: 1
+      KAFKA_TRANSACTION_STATE_LOG_MIN_ISR: 1
+      # Topics are declared explicitly (partitions and retention are architectural
+      # decisions here, see M3); silent auto-creation would hide mistakes.
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: "false"
+      KAFKA_GROUP_INITIAL_REBALANCE_DELAY_MS: 0
+      CLUSTER_ID: sentinel-local-cluster
+    ports:
+      - "9092:9092"
+    volumes:
+      - kafka-data:/var/lib/kafka/data
+    healthcheck:
+      test: ["CMD-SHELL", "/opt/kafka/bin/kafka-broker-api-versions.sh --bootstrap-server localhost:9092 >/dev/null 2>&1"]
+      interval: 10s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+    networks:
+      - sentinel
+
+volumes:
+  postgres-data:
+  redis-data:
+  kafka-data:
+
+networks:
+  sentinel:
+    name: sentinel
