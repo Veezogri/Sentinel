@@ -36,10 +36,54 @@
             <artifactId>spring-boot-starter-actuator</artifactId>
         </dependency>
 
-        <!-- JUnit 5, AssertJ, MockMvc. -->
+        <!-- Kafka producer and consumer, plus the listener container. Version comes from
+             spring-boot-dependencies so it always matches the Boot release. -->
+        <dependency>
+            <groupId>org.springframework.kafka</groupId>
+            <artifactId>spring-kafka</artifactId>
+        </dependency>
+
+        <!-- JSR-310 support for Jackson: without it Instant serialises as an object of
+             fields rather than an ISO-8601 string, which would be a poor wire contract. -->
+        <dependency>
+            <groupId>com.fasterxml.jackson.datatype</groupId>
+            <artifactId>jackson-datatype-jsr310</artifactId>
+        </dependency>
+
+        <!-- JUnit 5, AssertJ, MockMvc, Mockito. -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
             <artifactId>spring-boot-starter-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+        <!-- An in-JVM Kafka broker. Gives the pipeline real broker semantics — partitions,
+             consumer groups, offsets, dead-lettering — on every build, including on machines and
+             runners with no container runtime. -->
+        <dependency>
+            <groupId>org.springframework.kafka</groupId>
+            <artifactId>spring-kafka-test</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+        <!-- @ServiceConnection: points Spring at the container's bootstrap servers without the
+             test having to restate the property. -->
+        <dependency>
+            <groupId>org.springframework.boot</groupId>
+            <artifactId>spring-boot-testcontainers</artifactId>
+            <scope>test</scope>
+        </dependency>
+
+        <!-- A real broker for the integration tests, started per run and thrown away.
+             Only Kafka: PostgreSQL and Redis containers arrive with M4 and M5. -->
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>kafka</artifactId>
+            <scope>test</scope>
+        </dependency>
+        <dependency>
+            <groupId>org.testcontainers</groupId>
+            <artifactId>junit-jupiter</artifactId>
             <scope>test</scope>
         </dependency>
     </dependencies>
@@ -51,6 +95,25 @@
             <plugin>
                 <groupId>org.springframework.boot</groupId>
                 <artifactId>spring-boot-maven-plugin</artifactId>
+            </plugin>
+
+            <!-- Two test tiers, split by filename so the split needs no annotations:
+                   *Test  -> surefire, pure JVM, runs in seconds with no Docker
+                   *IT    -> failsafe, needs a container runtime
+                 `mvn test` is the fast inner loop; `mvn verify` runs both. Integration
+                 tests disable themselves when no Docker daemon is reachable rather than
+                 failing the build, so a clone without Docker still builds green. -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-failsafe-plugin</artifactId>
+                <executions>
+                    <execution>
+                        <goals>
+                            <goal>integration-test</goal>
+                            <goal>verify</goal>
+                        </goals>
+                    </execution>
+                </executions>
             </plugin>
 
             <!-- The machine this project is developed on carries several JDKs.
