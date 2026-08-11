@@ -75,11 +75,20 @@ class SimulationPipelineEndToEndTest {
                         .as("every simulated machine should reach the state store")
                         .isEqualTo(MACHINE_COUNT));
 
-        log.info("PIPELINE PROOF | produced={} publishedAck={} failed={} machinesWithState={}",
-                runner.producedEventCount(), publisher.publishedCount(),
-                publisher.failedCount(), stateStore.size());
+        // Sends are asynchronous, so reading the counters the instant the state store fills would
+        // show acknowledged trailing scheduled — in-flight work that is easily misread as loss.
+        // Wait for the producer to drain first, then every number means one thing.
+        await().atMost(TIMEOUT).until(() -> publisher.pendingCount() == 0);
 
-        assertThat(runner.producedEventCount()).isGreaterThanOrEqualTo(MACHINE_COUNT);
+        long scheduled = publisher.scheduledCount();
+        log.info("PIPELINE PROOF | scheduled={} acknowledged={} failed={} pending={} machinesWithState={}",
+                scheduled, publisher.acknowledgedCount(), publisher.failedCount(),
+                publisher.pendingCount(), stateStore.size());
+
+        assertThat(scheduled).isGreaterThanOrEqualTo(MACHINE_COUNT);
+        assertThat(publisher.acknowledgedCount())
+                .as("once drained, every scheduled send is either acknowledged or failed")
+                .isEqualTo(scheduled);
         assertThat(publisher.failedCount()).isZero();
     }
 

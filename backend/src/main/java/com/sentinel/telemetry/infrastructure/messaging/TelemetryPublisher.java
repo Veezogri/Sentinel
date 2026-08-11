@@ -45,7 +45,12 @@ public class TelemetryPublisher {
     private final KafkaTemplate<String, Object> kafkaTemplate;
     private final TelemetryMessageMapper mapper;
 
-    private final LongAdder published = new LongAdder();
+    // Three counters, not two. A send is handed to the producer long before the broker answers,
+    // so "scheduled" and "acknowledged" are legitimately different numbers at any instant and the
+    // gap between them is in-flight work, not loss. Reporting only a produced/published pair
+    // invites reading that gap as dropped events.
+    private final LongAdder scheduled = new LongAdder();
+    private final LongAdder acknowledged = new LongAdder();
     private final LongAdder failed = new LongAdder();
 
     public TelemetryPublisher(KafkaTemplate<String, Object> kafkaTemplate, TelemetryMessageMapper mapper) {
@@ -70,6 +75,7 @@ public class TelemetryPublisher {
                         Integer.toString(message.schemaVersion()).getBytes()))
                 .add(new RecordHeader(HEADER_EVENT_ID, event.eventId().toString().getBytes()));
 
+        scheduled.increment();
         CompletableFuture<SendResult<String, Object>> sent = kafkaTemplate.send(record);
         sent.whenComplete((result, throwable) -> {
             if (throwable != null) {
@@ -77,18 +83,35 @@ public class TelemetryPublisher {
                 log.error("failed to publish event {} for machine {}",
                         event.eventId(), event.machineId(), throwable);
             } else {
-                published.increment();
+                acknowledged.increment();
             }
         });
         return sent;
     }
 
-    /** Records the broker has acknowledged. Counters, not metrics: Micrometer arrives in M14. */
-    public long publishedCount() {
-        return published.sum();
+    /** Sends handed to the producer. Counters, not metrics: Micrometer arrives in M14. */
+    public long scheduledCount() {
+        return scheduled.sum();
     }
 
+    /** Sends the broker has acknowledged. */
+    public long acknowledgedCount() {
+        return acknowledged.sum();
+    }
+
+    /** Sends the broker rejected, or that exhausted the producer's delivery timeout. */
     public long failedCount() {
         return failed.sum();
+    }
+
+    /**
+     * Sends handed over but not yet resolved either way.
+     *
+     * <p>Read from three separate counters, so the result is a close estimate rather than an
+     * instantaneous truth — a send can complete between two of the reads. That is precise enough
+     * to answer the only question asked of it: whether the producer has drained.
+     */
+    public long pendingCount() {
+        return scheduled.sum() - acknowledged.sum() - failed.sum();
     }
 }

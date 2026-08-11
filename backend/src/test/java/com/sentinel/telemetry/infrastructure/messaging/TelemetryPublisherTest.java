@@ -130,8 +130,10 @@ class TelemetryPublisherTest {
 
         publisher.publish(event(MACHINE_ID));
 
-        assertThat(publisher.publishedCount()).isEqualTo(1);
+        assertThat(publisher.scheduledCount()).isEqualTo(1);
+        assertThat(publisher.acknowledgedCount()).isEqualTo(1);
         assertThat(publisher.failedCount()).isZero();
+        assertThat(publisher.pendingCount()).isZero();
     }
 
     /** An asynchronous failure must not vanish: this is the whole point of observing the future. */
@@ -142,7 +144,31 @@ class TelemetryPublisherTest {
         publisher.publish(event(MACHINE_ID));
 
         assertThat(publisher.failedCount()).isEqualTo(1);
-        assertThat(publisher.publishedCount()).isZero();
+        assertThat(publisher.acknowledgedCount()).isZero();
+        assertThat(publisher.pendingCount()).isZero();
+    }
+
+    /**
+     * A send that has been handed over but not yet answered is <em>pending</em>, not lost. Counting
+     * it as neither acknowledged nor failed is what stops an in-flight gap from being read as
+     * dropped events.
+     */
+    @Test
+    void shouldReportAnUnresolvedSendAsPendingRatherThanLost() {
+        CompletableFuture<SendResult<String, Object>> neverCompletes = new CompletableFuture<>();
+        when(kafkaTemplate.send(any(ProducerRecord.class))).thenReturn(neverCompletes);
+
+        publisher.publish(event(MACHINE_ID));
+
+        assertThat(publisher.scheduledCount()).isEqualTo(1);
+        assertThat(publisher.acknowledgedCount()).isZero();
+        assertThat(publisher.failedCount()).isZero();
+        assertThat(publisher.pendingCount()).isEqualTo(1);
+
+        neverCompletes.complete(mock(SendResult.class));
+
+        assertThat(publisher.acknowledgedCount()).isEqualTo(1);
+        assertThat(publisher.pendingCount()).isZero();
     }
 
     private static String header(ProducerRecord<String, Object> record, String name) {

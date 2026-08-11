@@ -1,8 +1,6 @@
 package com.sentinel.simulation.runtime;
 
 import java.time.Clock;
-import java.util.List;
-import java.util.concurrent.atomic.LongAdder;
 
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -33,7 +31,6 @@ public class SimulationRunner {
 
     private final SimulationEngine engine;
     private final TelemetryPublisher publisher;
-    private final LongAdder producedEvents = new LongAdder();
 
     public SimulationRunner(
             SimulationProperties properties,
@@ -70,16 +67,9 @@ public class SimulationRunner {
      */
     @Scheduled(fixedDelayString = "${sentinel.simulation.tick-interval}")
     public void publishNextRound() {
-        List<TelemetryEvent> events = engine.tick();
-        for (TelemetryEvent event : events) {
+        for (TelemetryEvent event : engine.tick()) {
             publisher.publish(event);
         }
-        producedEvents.add(events.size());
-    }
-
-    /** Events handed to the publisher since startup, for the runtime proof and later metrics. */
-    public long producedEventCount() {
-        return producedEvents.sum();
     }
 
     public SimulationEngine engine() {
