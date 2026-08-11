@@ -36,8 +36,27 @@ jobs:
           java-version: '21'
           cache: maven
 
-      - name: Build and run tests
+      # verify runs surefire (unit + embedded-broker tests) and then failsafe (Testcontainers),
+      # so a unit failure still stops the build before any container is pulled.
+      - name: Build and test
         run: ./mvnw -B --no-transfer-progress clean verify
+
+      # Integration tests disable themselves when no Docker daemon is reachable, which is what
+      # keeps the build green on a developer machine without one. On CI that same behaviour would
+      # turn a broken runner into a silent pass, so here it is treated as a failure.
+      - name: Fail if integration tests were skipped
+        run: |
+          reports=(target/failsafe-reports/TEST-*.xml)
+          if [ ! -e "${reports[0]}" ]; then
+            echo "::error::no failsafe reports produced — integration tests did not run"
+            exit 1
+          fi
+          skipped=$(grep -ho 'skipped="[0-9]*"' "${reports[@]}" | grep -oE '[0-9]+' | paste -sd+ - | bc)
+          if [ "${skipped:-0}" -gt 0 ]; then
+            echo "::error::$skipped integration test(s) skipped; Docker must be available on CI"
+            exit 1
+          fi
+          echo "all integration tests executed"
 
       - name: Package application
         run: ./mvnw -B --no-transfer-progress package -DskipTests
@@ -47,6 +66,8 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@v4
         with:
-          name: surefire-reports
-          path: backend/target/surefire-reports/
+          name: test-reports
+          path: |
+            backend/target/surefire-reports/
+            backend/target/failsafe-reports/
           retention-days: 7
