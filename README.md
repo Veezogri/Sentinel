@@ -2,7 +2,7 @@
 
 **Real-Time Industrial Monitoring Platform** — Java 21 · Spring Boot · Kafka · Angular
 
-> **Project status: Milestone 2 — Telemetry simulator.**
+> **Project status: Milestone 3 — Kafka ingestion.**
 > This README documents only what exists in the repository today. Everything else lives in
 > the [Roadmap](#roadmap) until it is actually implemented. No performance figure will appear
 > here unless it comes from a real measured run.
@@ -335,6 +335,156 @@ The simulator is single-threaded on purpose. Reproducibility is worth more here 
 and nothing has shown generation to be a bottleneck — a local run produced 1 000 000 events in
 about 400 ms on one thread, which is far beyond the ingestion rates this project targets.
 
+## Kafka architecture
+
+The first executable path through the platform. Everything below actually runs.
+
+```mermaid
+flowchart TD
+    SR["SimulationRunner<br/><i>@Scheduled, wall clock</i>"] --> SE["SimulationEngine<br/><i>simulated clock</i>"]
+    SE --> TP["TelemetryPublisher<br/><i>key = machineId</i>"]
+    TP --> K[("sentinel.telemetry.raw<br/>6 partitions")]
+    K --> TL["TelemetryListener<br/><i>@KafkaListener, 3 threads</i>"]
+    TL --> TM["TelemetryMessageMapper<br/><i>wire → domain</i>"]
+    TM --> PR["TelemetryProcessor"]
+    PR --> ST["MachineStateStore<br/><i>in-memory, ephemeral</i>"]
+    PR --> RE["RuleEngine<br/><i>findings</i>"]
+    TL -. "unparseable / invalid / retries exhausted" .-> DLQ[("sentinel.dead-letter")]
+```
+
+| Topic | Partitions | Replication | Purpose |
+|---|---|---|---|
+| `sentinel.telemetry.raw` | 6 | 1 (local) | Raw telemetry, keyed by `machineId` |
+| `sentinel.dead-letter` | 1 | 1 (local) | Records that could not be processed |
+
+Topics are declared as `NewTopic` beans and created by `KafkaAdmin` at startup. Broker-side
+auto-creation stays **disabled**: partition count and retention are design decisions, and a topic
+that appears with defaults because a name was mistyped is a failure that presents as silence. The
+limit of this approach is that `KafkaAdmin` only ever *creates* — it will not repartition an
+existing topic, so in production this provisioning belongs in infrastructure-as-code.
+
+**One broker, replication factor 1.** This is a development topology with no redundancy: losing
+the broker loses the data. A production cluster would use at least three brokers with
+`replication.factor=3` and `min.insync.replicas=2`.
+
+### Partitioning strategy
+
+Every record is keyed by `machineId`, so a machine's events always hash to the same partition.
+Kafka orders records **within a partition** and promises nothing across partitions, so this key is
+the entire ordering guarantee. Six partitions is a starting point for local development, not a
+derived figure — it is not tied to the machine count, the machine types or the CPU count. It also
+caps consumer parallelism, since a partition is read by at most one member of a group at a time;
+consumer concurrency is set to 3, so each thread owns two partitions. Full reasoning in
+[ADR-002](docs/adr/ADR-002-kafka-partitioning-by-machine.md).
+
+### Telemetry wire contract
+
+The domain model is **not** the wire format. Publishing `TelemetryEvent` directly would make every
+internal rename a protocol break for messages already sitting in a topic. `TelemetryMessage` is a
+separate, versioned contract with an explicit mapper — see
+[ADR-003](docs/adr/ADR-003-wire-contract-separate-from-domain.md).
+
+```json
+{
+  "schemaVersion": 1,
+  "eventId": "22222222-2222-2222-2222-222222222222",
+  "machineId": "11111111-1111-1111-1111-111111111111",
+  "occurredAt": "2026-01-15T10:00:00Z",
+  "readings": {
+    "temperatureCelsius": 62.5,
+    "vibrationMillimetresPerSecond": 2.4,
+    "pressureBar": 5.9,
+    "powerConsumptionKilowatts": 35.1,
+    "rotationSpeedRpm": 1450.0
+  }
+}
+```
+
+Units live in the field names so a consumer in another language cannot assume psi where the
+producer meant bar. No Java type headers are written to the topic. JSON rather than Avro or
+Protobuf: reading a record straight off a topic is worth more right now than the bytes a binary
+format would save, and a schema registry earns its place once contracts cross team boundaries.
+
+### Delivery semantics
+
+Kafka is often described as offering exactly-once delivery. It does not, not by default and not by
+configuration alone. What Sentinel actually has:
+
+| | Guarantee | Why |
+|---|---|---|
+| **Producer** | No duplicates from *producer retries* | `acks=all` plus `enable.idempotence=true`: the broker recognises a re-sent batch by its sequence number. This says nothing about duplicates seen further downstream |
+| **Consumer** | **At-least-once** | Offsets are committed by the listener container *after* the listener returns. A crash between processing and commit replays the record |
+| **End to end** | **At-least-once** | Which means: **an event can be processed more than once, and the application must cope** |
+
+Exactly-once would require either Kafka transactions spanning consume-process-produce, or
+idempotent processing keyed on `eventId`. Sentinel will take the second route (M5), because the
+side effects that matter — machine state, alerts — are ones the application controls.
+
+### Ordering and duplicates
+
+These are two different problems and are handled separately.
+
+**Late / out-of-order event** — a *different* event whose timestamp precedes one already seen.
+Keying by machine makes this rare, but the guarantee does not survive a retry, a replay from an
+earlier offset, or a rebalance mid-batch. Such an event is accepted and evaluated by the rules; it
+simply does not move current state backwards, because `MachineState.apply` declines anything not
+strictly newer. It is real data, and historical persistence (M4) will still want it.
+
+**Duplicate** — the *same* `eventId` delivered twice. **Nothing suppresses this yet.** The event is
+processed again in full. Current state happens to be unaffected, because a redelivery carries the
+same timestamp and is therefore declined — but that is state protection, not idempotency, and it
+would not prevent a duplicate alert once alerts exist. Durable deduplication lands in M5.
+
+### Failure handling
+
+Three kinds of failure, two treatments:
+
+| Failure | Example | Treatment |
+|---|---|---|
+| Malformed payload | Not valid JSON | **Not retried** → dead-letter |
+| Invalid domain content | Negative rpm, unknown `schemaVersion` | **Not retried** → dead-letter |
+| Processing failure | A bug, a dependency down | Retried 4 times with exponential backoff (500 ms → 4 s), then dead-letter |
+
+The first two are deterministic: replaying the same bytes fails the same way forever, so retrying
+them burns the budget and delays every record behind them. This is the poison-pill problem —
+Kafka cannot skip a record and come back to it, because an offset is a position in a log, not an
+item in a work queue. A record that always fails and is always retried blocks its partition
+permanently while the consumer still looks healthy.
+
+Dead-lettered records carry the original topic, partition, offset, exception class and stack trace
+in headers. Records that failed to *deserialise* are republished as their original bytes through a
+byte-serialising template, so the payload stays readable rather than arriving base64-wrapped.
+
+Retries are bounded. There is no configuration in this project that retries forever.
+
+## Local Kafka
+
+```bash
+docker compose up -d --wait
+docker compose exec kafka /opt/kafka/bin/kafka-topics.sh \
+  --bootstrap-server localhost:9092 --describe --topic sentinel.telemetry.raw
+```
+
+Run the backend with the simulated fleet publishing into it:
+
+```bash
+cd backend
+./mvnw spring-boot:run -Dspring-boot.run.arguments=--sentinel.simulation.enabled=true
+```
+
+The simulator is **off by default**, so the ingestion pipeline can be pointed at a real producer
+without the backend manufacturing its own traffic.
+
+| Setting | Default | Meaning |
+|---|---|---|
+| `sentinel.simulation.enabled` | `false` | Run the simulated fleet |
+| `sentinel.simulation.machine-count` | `20` | Fleet size |
+| `sentinel.simulation.tick-interval` | `1s` | Wall-clock period between rounds, and the simulated time each round advances |
+| `sentinel.simulation.anomaly-probability` | `0.002` | Chance one healthy machine develops a fault on one tick |
+| `sentinel.simulation.seed` | `42` | Makes a run reproducible |
+| `sentinel.kafka.consumer-group` | `sentinel-telemetry-processor` | Consumer group id |
+| `sentinel.kafka.concurrency` | `3` | Listener threads, capped by the 6 partitions |
+
 ## Alert lifecycle
 
 An alert is not a mutable status holder. `Alert` is immutable, transitions return a new
@@ -408,10 +558,31 @@ cd backend && ./mvnw test
 | `CommunicationLossTest` | a silenced machine emits nothing, keeps evolving, and produces a gap the domain reads as `OFFLINE` |
 | `SimulatorRuleIntegrationTest` | a simulated overheat actually drives `HighTemperatureRule` to `CRITICAL` |
 
-The domain is tested with plain JUnit — no `@SpringBootTest`, no mocks. The business objects are
-directly instantiable, so there is nothing to stand up and nothing to fake; the only Spring test
-in the suite is the M0 bootstrap check. No test requires a running container at this stage.
-Testcontainers-based integration tests arrive with persistence (M4).
+| `KafkaPipelineSmokeTest`, `KafkaFailureHandlingTest` | the whole pipeline against a real in-process broker: partitioning, late events, poison pills, dead-lettering |
+| `SimulationPipelineEndToEndTest` | the scheduled runner driving simulator → Kafka → consumer → rules |
+| `InMemoryMachineStateStoreTest` | that concurrent updates to one machine cannot lose each other |
+| `DomainPurityTest` | that no framework or serialisation import has crept into a domain package |
+
+The domain is tested with plain JUnit — no `@SpringBootTest`, no mocks.
+
+### Two tiers of test
+
+```bash
+./mvnw test      # fast, no Docker required
+./mvnw verify    # the above, plus integration tests
+```
+
+| Tier | Naming | Runner | Broker |
+|---|---|---|---|
+| Unit + pipeline | `*Test` | Surefire | none, or an **embedded** in-process Kafka |
+| Integration | `*IT` | Failsafe | **Testcontainers**, `apache/kafka:3.9.0` |
+
+The embedded broker is real Kafka — partitions, keys, consumer groups, offsets — so the pipeline is
+exercised on every build regardless of whether Docker is installed. The `*IT` classes run the same
+scenarios against the exact image used in Compose, which is what would catch version-specific
+behaviour. **Integration tests skip themselves when no Docker daemon is reachable** rather than
+failing the build; a skipped test proves nothing, and the build output says `Skipped` rather than
+pretending otherwise.
 
 ---
 
@@ -423,6 +594,11 @@ live in [`docs/adr/`](docs/adr/):
 - [**ADR-001 — Machine state modelling**](docs/adr/ADR-001-machine-state-modelling.md): why a
   single `MachineStatus` enum was replaced by three orthogonal ones, why `Machine` and
   `MachineState` are separate objects, and why connectivity is derived while health is stored.
+- [**ADR-002 — Partition telemetry by machineId**](docs/adr/ADR-002-kafka-partitioning-by-machine.md):
+  what Kafka's ordering guarantee actually covers, why the key is the machine, and why six
+  partitions is a starting point rather than a derived number.
+- [**ADR-003 — A wire contract separate from the domain**](docs/adr/ADR-003-wire-contract-separate-from-domain.md):
+  why `TelemetryEvent` is not published directly, and why the contract is versioned from day one.
 
 Decisions not large enough to warrant their own record:
 
@@ -444,16 +620,25 @@ Decisions not large enough to warrant their own record:
 
 ## Known limitations
 
-At Milestone 2, events can be generated but nothing transports or stores them:
+At Milestone 3, telemetry flows end to end but nothing is stored durably:
 
-- No ingestion, no persistence, no transport. The rule engine is never invoked at runtime — it
-  is exercised only by tests, and no code path yet turns a `RuleResult` into an `Alert`.
-- The simulator has no runnable entry point: it is a library driven from tests, with no Spring
-  wiring and no scheduler. Making it produce in real time is part of M3.
-- Anomaly intensity and duration are fixed per fault type rather than varying across incidents,
-  and no fault targets rotation speed.
-- The 1 000 000-events-in-~400 ms figure above is a local single-run diagnostic on one machine,
-  not a benchmark: no warmed-up harness, no repetitions, no distribution.
+- **Nothing survives a restart.** `MachineStateStore` and `MachineRegistry` are in-memory
+  stand-ins for Redis (M5) and PostgreSQL (M4). Two backend instances would each hold their own
+  divergent view of the fleet.
+- **No deduplication.** An event delivered twice is processed twice. Delivery is at-least-once and
+  the application does not yet compensate for it.
+- **Findings are not alerts.** The rule engine runs in the consumer path and its findings are
+  returned and logged; no `Alert` is created, deduplicated or published. That is M6.
+- **The machine registry is populated by the simulator.** A real producer's machines would be
+  unknown to the consumer, and rule evaluation is skipped for an unregistered machine.
+- **No backpressure.** The scheduler uses a fixed delay, so a slow producer falls behind real time
+  rather than compounding; but if Kafka cannot keep up, records queue in the producer's buffer
+  until it blocks or times out. There is no outbox and no flow control.
+- **The `*IT` Testcontainers tests have never been executed** on the development machine — Docker
+  cannot be installed on it (see below). They are written but unverified; the equivalent scenarios
+  are covered against an embedded broker, which does run.
+- Anomaly intensity and duration are fixed per fault type, and no fault targets rotation speed.
+- The 1 000 000-events-in-~400 ms figure above is a local single-run diagnostic, not a benchmark.
 - No deduplication, cooldown or lifecycle orchestration; only the transitions themselves are
   enforced (M6).
 - Rules are single-sample. Temporal rules ("above 85 °C for 30 seconds") need previous state and
@@ -464,10 +649,11 @@ At Milestone 2, events can be generated but nothing transports or stores them:
   configurable per machine type is a later concern.
 - The backend does not connect to PostgreSQL, Kafka or Redis — the containers are defined but
   unused.
-- **`docker-compose.yml` has never been executed.** It was written and structurally validated,
-  but not run: the current Docker Desktop release requires macOS Sonoma and the development
-  machine is on Ventura. A Ventura-compatible Docker Desktop version must be installed before
-  the milestones that genuinely need Kafka, PostgreSQL, Redis or Testcontainers (M3 onward).
+- **`docker-compose.yml` has never been executed.** It was written and structurally validated, but
+  not run: Docker Desktop now requires macOS Sonoma and the development machine is on Ventura, and
+  Homebrew publishes no Ventura bottles for `colima`/`docker`. A Ventura-compatible Docker Desktop
+  release must be installed before anything that genuinely needs a containerised broker or
+  database. The Kafka work was verified against an embedded broker instead.
 - `/actuator/health` reports only application liveness, since there is no dependency to probe.
 - No authentication: every endpoint is currently public (security lands in M12).
 - The Docker Compose stack is a single-node development setup — one Kafka broker, no
@@ -481,7 +667,7 @@ At Milestone 2, events can be generated but nothing transports or stores them:
 - [x] **M0** — Bootstrap: backend skeleton, infrastructure, CI, health endpoint
 - [x] **M1** — Domain model: Machine, TelemetryEvent, MachineState, Alert, rule engine
 - [x] **M2** — Telemetry simulator: stateful evolution, machine profiles, persistent anomalies
-- [ ] **M3** — Kafka ingestion: serialization, partitioning by `machineId`, consumer groups
+- [x] **M3** — Kafka ingestion: versioned wire contract, partitioning by `machineId`, retry and DLQ
 - [ ] **M4** — PostgreSQL: Flyway, telemetry history, indexes, Testcontainers
 - [ ] **M5** — Redis: current state, last-seen tracking, idempotency
 - [ ] **M6** — Alert engine: rules, deduplication, cooldown, lifecycle
@@ -509,7 +695,10 @@ sentinel/
 │       ├── telemetry/domain/ TelemetryEvent, TelemetryReadings
 │       ├── alert/domain/     Alert and its lifecycle
 │       ├── rule/domain/      Rule, RuleResult, RuleEngine, rules/
-│       ├── simulation/       Virtual fleet, machine profiles, anomaly/
+│       ├── machine/          domain/ + application/ (state store, registry) + infrastructure/
+│       ├── telemetry/        domain/ + application/ (processor) + infrastructure/messaging/
+│       ├── simulation/       Virtual fleet, profiles, anomaly/ + runtime/ (Spring, scheduler)
+│       ├── infrastructure/   Kafka topics, producer and error handling
 │       └── system/           Health endpoint
 ├── docs/adr/                 Architecture Decision Records
 ├── .github/workflows/        CI pipelines
