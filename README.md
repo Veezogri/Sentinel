@@ -2,7 +2,7 @@
 
 **Real-Time Industrial Monitoring Platform** — Java 21 · Spring Boot · Kafka · Angular
 
-> **Project status: Milestone 1 — Domain model.**
+> **Project status: Milestone 2 — Telemetry simulator.**
 > This README documents only what exists in the repository today. Everything else lives in
 > the [Roadmap](#roadmap) until it is actually implemented. No performance figure will appear
 > here unless it comes from a real measured run.
@@ -259,6 +259,82 @@ is pinned by tests.
 Rules are immutable and stateless, so one `RuleEngine` instance is safe to share across every
 consumer thread without synchronisation.
 
+## Telemetry simulation
+
+A fleet needs to exist before there is anything to supervise. The simulator generates that fleet
+in memory, with no Kafka, no Spring and no dependency on the rule engine — it is a source of
+`TelemetryEvent`s, not a component of the alerting path.
+
+```mermaid
+flowchart LR
+    P["MachineProfile<br/>nominal · noise · reversion · sensor bounds"] --> V
+    V["VirtualMachine<br/>current readings + active fault"] --> T
+    A["Anomaly<br/>ramp up · hold · ramp down"] -- "shifts the target" --> V
+    T["TelemetryEvent"]
+    V -. "silent while the link is down" .-> X(["no event"])
+```
+
+**Readings evolve; they are not redrawn.** Each signal follows a discrete mean-reverting process:
+
+```
+target = nominal + anomalyOffset
+next   = current + reversionRate × (target − current) + gaussianNoise
+```
+
+This is an AR(1) process, chosen over a plain random walk for one concrete reason: it is
+*stationary*. A walk has unbounded variance and would wander to absurd values over a long run;
+the pull toward the target bounds the spread instead of relying on clamping to hide it. A
+10 000-tick run is asserted to stay within 10 °C of nominal and to remain centred on it.
+
+**An anomaly shifts the target, not the reading.** Because the reading chases a moving target,
+both the climb into a fault and the recovery out of it fall out of that single line of
+arithmetic — there is no separate recovery code, and a discontinuous one-tick spike is not
+expressible. A fault runs through `DEVELOPING → ACTIVE → RECOVERING → FINISHED`, its strength
+following an envelope over its lifetime. A real forced overheat on a `PUMP`:
+
+```
+tick   phase          temp
+0      healthy        62.2
+5      developing     62.6
+10     developing     66.8
+15     developing     78.8
+20     active         91.7
+30     active        104.5
+50     active        106.4
+55     recovering    101.8
+60     recovering     91.4
+65     recovered      76.8
+80     recovered      64.3
+95     recovered      62.2
+```
+
+**Communication loss is silence, not a reading.** A machine that has lost its link emits nothing
+at all. Emitting an event flagged "offline" would be self-defeating, since absence of telemetry
+is exactly the evidence `MachineState.connectivityAt` consumes. Internal state keeps evolving
+during the outage: the equipment is still running, it just cannot be heard.
+
+**Machine profiles differ by type.** A turbine spins at 9 000 rpm and draws 180 kW; a motor runs
+at 1 750 rpm and 22 kW. Every number lives in `MachineProfiles` and nowhere else. Nominal values
+sit well inside the default rule bands, because a simulator whose idle state trips the rules
+makes every alert meaningless. Sensor bounds are far *outside* those bands, because a signal
+clamped at its warning level could never reach critical.
+
+**Everything is reproducible from a seed.** Fleet identity, per-tick noise, fault timing and
+fault type all derive from `SimulationConfig.seed`; two runs with the same configuration produce
+identical readings. Each machine draws from its own generator split from the master, so growing
+the fleet does not perturb the machines already in it. Event identifiers are the deliberate
+exception — they come from an injectable supplier defaulting to `UUID.randomUUID()`, because a
+producer deriving them from a seed would mint colliding identifiers across two processes, and
+event identity is what duplicate detection will rest on.
+
+**Simulated time is not wall-clock time.** `tick()` advances an internal instant and never
+sleeps, so a test can fast-forward through a two-minute fault instantly. Real-time scheduling
+belongs to whatever drives the engine, not inside it.
+
+The simulator is single-threaded on purpose. Reproducibility is worth more here than throughput,
+and nothing has shown generation to be a bottleneck — a local run produced 1 000 000 events in
+about 400 ms on one thread, which is far beyond the ingestion rates this project targets.
+
 ## Alert lifecycle
 
 An alert is not a mutable status holder. `Alert` is immutable, transitions return a new
@@ -325,6 +401,12 @@ cd backend && ./mvnw test
 | `MachineTest` | registration, maintenance mode, immutability of mutators |
 | `HighTemperatureRuleTest`, `ExcessiveVibrationRuleTest`, `AbnormalPressureRuleTest` | threshold behaviour just below, exactly at, and just above each limit |
 | `RuleEngineTest` | zero, one and several simultaneous findings; worst-severity health |
+| `SimulationEngineTest` | same seed reproduces a run exactly; fleet growth does not perturb existing machines; simulated clock advances by the configured interval |
+| `SignalEvolutionTest` | consecutive readings move in small steps, and a 10 000-tick run neither drifts nor leaves nominal range |
+| `AnomalyTest`, `AnomalyLifecycleTest` | envelope continuity, the full `DEVELOPING → ACTIVE → RECOVERING → FINISHED` progression, threshold crossing and gradual recovery |
+| `ProbabilisticAnomalyTest` | spontaneous faults appear, stay reproducible, and are not restarted while already running |
+| `CommunicationLossTest` | a silenced machine emits nothing, keeps evolving, and produces a gap the domain reads as `OFFLINE` |
+| `SimulatorRuleIntegrationTest` | a simulated overheat actually drives `HighTemperatureRule` to `CRITICAL` |
 
 The domain is tested with plain JUnit — no `@SpringBootTest`, no mocks. The business objects are
 directly instantiable, so there is nothing to stand up and nothing to fake; the only Spring test
@@ -362,10 +444,16 @@ Decisions not large enough to warrant their own record:
 
 ## Known limitations
 
-At Milestone 1, the domain exists but nothing carries data into it:
+At Milestone 2, events can be generated but nothing transports or stores them:
 
 - No ingestion, no persistence, no transport. The rule engine is never invoked at runtime — it
   is exercised only by tests, and no code path yet turns a `RuleResult` into an `Alert`.
+- The simulator has no runnable entry point: it is a library driven from tests, with no Spring
+  wiring and no scheduler. Making it produce in real time is part of M3.
+- Anomaly intensity and duration are fixed per fault type rather than varying across incidents,
+  and no fault targets rotation speed.
+- The 1 000 000-events-in-~400 ms figure above is a local single-run diagnostic on one machine,
+  not a benchmark: no warmed-up harness, no repetitions, no distribution.
 - No deduplication, cooldown or lifecycle orchestration; only the transitions themselves are
   enforced (M6).
 - Rules are single-sample. Temporal rules ("above 85 °C for 30 seconds") need previous state and
@@ -392,7 +480,7 @@ At Milestone 1, the domain exists but nothing carries data into it:
 
 - [x] **M0** — Bootstrap: backend skeleton, infrastructure, CI, health endpoint
 - [x] **M1** — Domain model: Machine, TelemetryEvent, MachineState, Alert, rule engine
-- [ ] **M2** — Telemetry simulator with stateful, realistic value evolution
+- [x] **M2** — Telemetry simulator: stateful evolution, machine profiles, persistent anomalies
 - [ ] **M3** — Kafka ingestion: serialization, partitioning by `machineId`, consumer groups
 - [ ] **M4** — PostgreSQL: Flyway, telemetry history, indexes, Testcontainers
 - [ ] **M5** — Redis: current state, last-seen tracking, idempotency
@@ -421,6 +509,7 @@ sentinel/
 │       ├── telemetry/domain/ TelemetryEvent, TelemetryReadings
 │       ├── alert/domain/     Alert and its lifecycle
 │       ├── rule/domain/      Rule, RuleResult, RuleEngine, rules/
+│       ├── simulation/       Virtual fleet, machine profiles, anomaly/
 │       └── system/           Health endpoint
 ├── docs/adr/                 Architecture Decision Records
 ├── .github/workflows/        CI pipelines
