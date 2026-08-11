@@ -1,0 +1,21 @@
+# Profile used by the integration tests. Only the differences from application.yml.
+sentinel:
+  simulation:
+    # Integration tests publish the exact events they want to assert on. Background traffic
+    # would make every assertion race against a fleet of machines.
+    enabled: false
+  kafka:
+    # One thread: with a single test publishing a handful of records, extra consumer threads add
+    # rebalance noise and nothing else.
+    concurrency: 1
+
+spring:
+  kafka:
+    consumer:
+      auto-offset-reset: earliest
+
+logging:
+  level:
+    org.apache.kafka: WARN
+    org.testcontainers: WARN
+    com.sentinel: DEBUG
