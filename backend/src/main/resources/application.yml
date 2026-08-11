@@ -5,6 +5,67 @@ spring:
     # truth for the version reported by /api/v1/system/health.
     version: @project.version@
 
+  kafka:
+    bootstrap-servers: ${KAFKA_BOOTSTRAP_SERVERS:localhost:9092}
+
+    producer:
+      key-serializer: org.apache.kafka.common.serialization.StringSerializer
+      value-serializer: org.springframework.kafka.support.serializer.JsonSerializer
+      # Wait for all in-sync replicas. On this single-broker setup that is one replica, so it
+      # buys durability against a crash between accept and flush, not against broker loss.
+      acks: all
+      properties:
+        # The producer tags each batch with a sequence number, so a retry caused by a lost
+        # acknowledgement is recognised by the broker and not written twice. This removes
+        # duplicates introduced by *producer retries*; it says nothing about duplicates seen by
+        # the consumer after a rebalance. See the delivery semantics section of the README.
+        enable.idempotence: true
+        max.in.flight.requests.per.connection: 5
+        # Total budget for a send, retries included. Bounded so a broker outage surfaces as a
+        # failed future rather than as an unbounded stall.
+        delivery.timeout.ms: 30000
+        request.timeout.ms: 10000
+        linger.ms: 20
+        # Do not put type headers on the wire: they would pin the payload to a Java class name
+        # and make the contract unusable from any other language.
+        spring.json.add.type.headers: false
+
+    consumer:
+      key-deserializer: org.apache.kafka.common.serialization.StringDeserializer
+      # A payload that cannot be parsed must not kill the container. ErrorHandlingDeserializer
+      # catches the failure and hands the record to the error handler, which dead-letters it.
+      value-deserializer: org.springframework.kafka.support.serializer.ErrorHandlingDeserializer
+      auto-offset-reset: earliest
+      # Offsets are committed by the listener container after the listener returns, never on a
+      # timer. Committing early would turn a processing failure into silent data loss.
+      enable-auto-commit: false
+      properties:
+        spring.deserializer.value.delegate.class: org.springframework.kafka.support.serializer.JsonDeserializer
+        spring.json.value.default.type: com.sentinel.telemetry.infrastructure.messaging.TelemetryMessage
+        spring.json.use.type.headers: false
+        spring.json.trusted.packages: com.sentinel.telemetry.infrastructure.messaging
+
+    listener:
+      ack-mode: batch
+      # Bounded so a stalled listener leaves the group instead of holding its partitions.
+      missing-topics-fatal: false
+
+sentinel:
+  kafka:
+    consumer-group: sentinel-telemetry-processor
+    # At most one member of a group reads a given partition, so this is capped by the six
+    # partitions of sentinel.telemetry.raw: a seventh thread would simply idle.
+    concurrency: 3
+
+  simulation:
+    # Off by default. Enable with --sentinel.simulation.enabled=true or the local profile.
+    enabled: false
+    machine-count: 20
+    tick-interval: 1s
+    anomaly-probability: 0.002
+    anomaly-duration: 2m
+    seed: 42
+
 server:
   port: ${SERVER_PORT:8080}
   shutdown: graceful
@@ -22,6 +83,11 @@ management:
   info:
     env:
       enabled: true
+  health:
+    # Kafka reachability is reported but does not fail the health check: the API and dashboard
+    # remain useful while ingestion is degraded.
+    kafka:
+      enabled: false
 
 info:
   application:
